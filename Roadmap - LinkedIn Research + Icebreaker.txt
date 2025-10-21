@@ -1,0 +1,163 @@
+Roadmap - LinkedIn Research + Icebreaker (MVP -> Production)
+
+1) Objective
+- Build the LinkedIn research module that:
+  - Scrapes LinkedIn profile data via PhantomBuster (Profile Scraper)
+  - Cleans/normalizes the JSON into a single raw_profile_text
+  - Summarizes with Groq (LLaMA 3) -> linkedin_summary
+  - Generates a JSON icebreaker with OpenAI GPT-4o -> {"icebreaker": "..."}
+  - Appends results to Google Sheets -> Leads_Enriched
+  - Pushes to Instantly (maps icebreaker to custom field)
+  - Logs errors to Errors_Log
+
+2) Deliverables
+- Implementation-agnostic specification and step-by-step runbook
+- API/data contracts for PhantomBuster, Groq, OpenAI, Google Sheets, Instantly
+- Prompts (Groq + GPT-4o) and mapping documentation
+- Google Sheets schemas: Leads_Verified, Leads_Enriched, Errors_Log
+- Test fixtures (3–5 rows) and acceptance criteria
+- Handoff notes for the integrator (platform guidance, rate-limit guidance)
+
+3) Prerequisites
+- Accounts/API keys:
+  - PhantomBuster API key and a valid LinkedIn session/cookie configured in the Phantom
+  - Groq API key
+  - OpenAI API key (GPT-4o)
+  - Instantly API key and target campaign + custom field name for icebreaker
+  - Google account with Sheets access
+- Google Sheets tabs and columns:
+  - Leads_Verified: first_name, email, linkedin_url (mandatory), plus any existing columns
+  - Leads_Enriched: all input columns + linkedin_summary, icebreaker
+  - Errors_Log: timestamp, email, error_stage, error_message, raw_payload
+- Rate-limit notes:
+  - PhantomBuster: set safe daily caps and per-run delays
+  - LinkedIn: respect anti-bot patterns; pace requests
+
+4) Implementation Scope & Platform
+- You will NOT build the automation. You will deliver specs, prompts, schemas, and contracts.
+- The integrator (client or contractor) selects the platform (n8n/Make/Pipedream or custom code).
+- Provide platform-agnostic guidance (rate limits, retries, error logging) for smooth implementation.
+
+5) Workflow Outline (MVP)
+- Trigger
+  - Manual trigger for development, then on-demand batch runner (e.g., read N new rows from Leads_Verified not yet enriched)
+- Validate input
+  - Ensure linkedin_url present; if missing -> Errors_Log and skip
+- Step A: Launch LinkedIn Scraper
+  - Action: Start PhantomBuster LinkedIn Profile Scraper with linkedin_url
+  - Capture run ID/reference for subsequent polling
+- Step B: Get Scraper Output
+  - Poll PhantomBuster for completion (retry with backoff)
+  - Download JSON (bio, headline, recent posts, experience, etc.)
+- Step C: Normalize JSON (Code node)
+  - Extract fields: headline, summary/bio, recent_activity (post texts/titles), current_role, company, location
+  - Build raw_profile_text as a compact, readable block
+  - Example format:
+    """
+    Headline: ...
+    Bio: ...
+    Recent: - Post 1
+            - Post 2
+    Role: Title @ Company
+    Location: ...
+    """
+  - If fields missing, degrade gracefully
+- Step D: Groq Summarizer (LLaMA 3)
+  - HTTP Request with prompt (see section 7) using raw_profile_text -> linkedin_summary
+  - Enforce short, high-signal output
+- Step E: GPT-4o Icebreaker (strict JSON)
+  - Prompt with linkedin_summary + first_name to produce {"icebreaker": "..."}
+  - Validate JSON; on parse failure, retry once with a stronger system message
+- Step F: Append to Google Sheets (Leads_Enriched)
+  - Append all original columns + linkedin_summary + icebreaker
+  - Ensure idempotency: avoid duplicate appends (track processed row IDs or use a status column)
+- Step G: Push to Instantly
+  - Map email and icebreaker to the target campaign + custom field
+  - Capture response; on non-2xx, log to Errors_Log
+- Step H: Error Branch
+  - For any failed stage (A-G), append a row to Errors_Log with timestamp, email, error_stage, error_message, raw_payload
+
+6) Data Mapping
+- Input (from Leads_Verified): first_name, email, linkedin_url
+- Derived: raw_profile_text (internal), linkedin_summary, icebreaker
+- Output (Leads_Enriched): All input columns + linkedin_summary + icebreaker
+- Instantly: email, custom_field_icebreaker (name provided by campaign setup)
+
+7) Prompts (Initial Drafts)
+- Groq (LLaMA 3) - Profile Summary
+  - System: "You are a concise personalization researcher. Keep outputs under 60 words."
+  - User: "Analyze this LinkedIn profile text and return a one-paragraph summary of professional focus and very recent activity. Avoid fluff; prefer specifics. Text:\n{{raw_profile_text}}"
+- OpenAI (GPT-4o) - Icebreaker JSON
+  - System: "You are an expert cold outreach copywriter. Return ONLY strict minified JSON with a single key 'icebreaker'. No additional text."
+  - User: "Using this summary and the recipient's first name, write a friendly, specific opener that references their recent work. 2 sentences max.\nfirst_name={{first_name}}\nlinkedin_summary={{linkedin_summary}}\nReturn JSON like {\"icebreaker\":\"...\"}."
+
+8) Error Handling & Retries (MVP -> Production)
+- PhantomBuster start/poll:
+  - Retries: 3 with exponential backoff (e.g., 10s, 20s, 40s)
+  - Timeouts with clear error_stage = "phantombuster_poll_timeout"
+- JSON normalization:
+  - If critical fields missing, proceed with what’s available; flag in Errors_Log for review
+- Groq request:
+  - On 429/5xx, retry 2-3 times with backoff; cap total latency
+- GPT-4o JSON validity:
+  - If non-JSON response, prepend a validator system message and retry once
+- Sheets append:
+  - On failure, retry once; otherwise log full payload to Errors_Log
+- Instantly push:
+  - If 4xx (bad mapping), stop and log; if 5xx, retry 2-3x with backoff
+
+9) Testing Plan
+- Unit-level (dev):
+  - Code node function with 3 fixture payloads: a rich profile, a sparse profile, and malformed JSON
+- Integration (staging sheet):
+  - 3 real rows:
+    - Valid linkedin_url with recent posts
+    - Valid linkedin_url but minimal data
+    - Invalid/broken linkedin_url (expect Errors_Log)
+- E2E acceptance:
+  - Each row results in exactly one Leads_Enriched append or one Errors_Log entry
+  - Instantly receives the correct custom field for icebreaker
+  - No duplicate enrichments when re-running
+
+10) Observability (MVP)
+- Add a run_id/correlation_id per lead for cross-step tracing
+- Log stage start/stop and status fields in n8n/Make
+- Optional: send summarized logs to a Slack channel
+
+11) Security & Config
+- Store API keys and LinkedIn session securely (n8n credentials or platform vault)
+- Parameterize:
+  - PHANTOMBUSTER_API_KEY, PHANTOM_ID (profile scraper), GROQ_API_KEY, OPENAI_API_KEY
+  - INSTANTLY_API_KEY, INSTANTLY_CAMPAIGN_ID, INSTANTLY_ICEBREAKER_FIELD
+  - SHEET_IDS or names, BATCH_SIZE, POLL_INTERVAL_MS
+
+12) Timeline Estimates (Beginner Developer)
+- Setup + keys + sheets: 2-4h
+- PhantomBuster wiring + test scrape: 3-5h
+- JSON normalization (Code node): 3-5h
+- Groq + prompt tuning: 1-2h
+- GPT-4o JSON icebreaker + validation: 1-2h
+- Sheets append + error branch: 1-2h
+- Instantly mapping + test: 1-2h
+- E2E test + fixes: 2-4h
+- Total MVP: 14-22h (plan for ~18h)
+- Hardening (retries, guardrails, small revisions): +6-10h
+
+13) Acceptance Criteria (MVP)
+- Given N valid rows in Leads_Verified with linkedin_url, running the workflow produces N new rows in Leads_Enriched with populated linkedin_summary and icebreaker
+- Each Instantly API call succeeds and returns an ID; failures land in Errors_Log
+- All failures produce a single row in Errors_Log with error_stage and message
+- Re-running on the same inputs does not create duplicates
+
+14) Stretch Goals (Post-MVP)
+- Batch queue with concurrency control (e.g., 1-2 concurrent leads)
+- Adaptive backoff on PhantomBuster to respect LinkedIn limits
+- Deduplication by email or linkedin_url hash
+- Slack/Discord alerts on Errors_Log entries
+- Simple dashboard (sheet pivot or n8n metrics) for daily counts
+
+15) Handover Package
+- Workflow export JSON and readme with variable names
+- Sheet links and schema
+- Example payloads (scraper output -> normalized input -> prompts -> outputs)
+- Short Loom/video walkthrough of one end-to-end run
